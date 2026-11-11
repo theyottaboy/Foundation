@@ -22,10 +22,13 @@ jobs:
     uses: ./.github/workflows/release-build-foundation-image.yml
     with:
       sha: ${{ github.sha }}
+      # Pull requests from forks can't publish; their images are passed on as artifacts.
+      push: ${{ github.event_name != 'pull_request' }}
 
   # This job attempts to load all Cryptol files in foundation.
   load-all-cry-files:
     needs: build-foundation-image
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     container: ghcr.io/nationalsecurityagency/foundation/cryptol-remote-api-client:latest
     services:
@@ -42,6 +45,7 @@ jobs:
   # This job attempts to run top-level SAW files in foundation.
   load-top-level-SAW-files:
     needs: build-foundation-image
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     container: ghcr.io/nationalsecurityagency/foundation/foundation-saw:${{ github.sha }}
     steps:
@@ -64,6 +68,7 @@ jobs:
   # This job attempts to run top-level SAW python files in foundation.
   load-top-level-SAW-python-files:
     needs: build-foundation-image
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     container: ghcr.io/nationalsecurityagency/foundation/foundation-saw:${{ github.sha }}
     steps:
@@ -84,3 +89,80 @@ jobs:
        run: |
          saw-remote-api http --host 0.0.0.0 --port 8080 / &
          .ci/run-saw-python-files.sh
+
+  # Pull requests run the same checks on the runner, from the image artifacts.
+  pr-load-all-cry-files:
+    needs: build-foundation-image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Load foundation image
+        uses: actions/download-artifact@v8
+        with:
+          name: foundation-image
+          path: /tmp
+      - run: docker load -i /tmp/foundation-image.tar
+      - name: Start Cryptol server
+        run: |
+          docker network create ci
+          docker run -d --name foundation --network ci -p 8080:8080 ghcr.io/nationalsecurityagency/foundation/foundation:${{ github.sha }}
+          timeout 60 sh -c 'until curl -s -o /dev/null http://localhost:8080; do sleep 1; done'
+      - name: Run python script to load all Cryptol files in virtual environment for Cryptol Remote API
+        run: |
+          docker run --rm --network ci -v "$PWD":/work -w /work -e CRYPTOL_SERVER_URL \
+            ghcr.io/nationalsecurityagency/foundation/cryptol-remote-api-client:latest \
+            $VENV_CRYPTOL/bin/python3 .ci/load-all-cry-files.py
+
+  pr-load-top-level-SAW-files:
+    needs: build-foundation-image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore SAW proof cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.SAW_SOLVER_CACHE_PATH }}
+          key: ${{ github.ref_name }}-saw-cache-${{ github.sha }}
+          restore-keys: |
+            ${{ github.ref_name }}-saw-cache-
+            main-saw-cache-
+      - name: Load foundation-saw image
+        uses: actions/download-artifact@v8
+        with:
+          name: foundation-saw-image
+          path: /tmp
+      - run: docker load -i /tmp/foundation-saw-image.tar
+      - name: Run top-level SAW files.
+        run: |
+          mkdir -p "$SAW_SOLVER_CACHE_PATH" && chmod -R a+rwX "$SAW_SOLVER_CACHE_PATH"
+          docker run --rm -v "$PWD/$SAW_SOLVER_CACHE_PATH":/home/saw/saw-cache -e SAW_SOLVER_CACHE_PATH=/home/saw/saw-cache \
+            ghcr.io/nationalsecurityagency/foundation/foundation-saw:${{ github.sha }} \
+            sh -c 'saw --clean-mismatched-versions-solver-cache && .ci/run-top-level-saw-files.sh'
+
+  pr-load-top-level-SAW-python-files:
+    needs: build-foundation-image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore SAW proof cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.SAW_SOLVER_CACHE_PATH }}
+          key: ${{ github.ref_name }}-saw-rust-cache-${{ github.sha }}
+          restore-keys: |
+            ${{ github.ref_name }}-saw-rust-cache-
+            main-saw-rust-cache-
+      - name: Load foundation-saw image
+        uses: actions/download-artifact@v8
+        with:
+          name: foundation-saw-image
+          path: /tmp
+      - run: docker load -i /tmp/foundation-saw-image.tar
+      - name: Run top-level SAW python files.
+        run: |
+          mkdir -p "$SAW_SOLVER_CACHE_PATH" && chmod -R a+rwX "$SAW_SOLVER_CACHE_PATH"
+          docker run --rm -v "$PWD/$SAW_SOLVER_CACHE_PATH":/home/saw/saw-cache -e SAW_SOLVER_CACHE_PATH=/home/saw/saw-cache -e SAW_SERVER_URL -e VENV_SAW \
+            ghcr.io/nationalsecurityagency/foundation/foundation-saw:${{ github.sha }} \
+            sh -c 'saw --clean-mismatched-versions-solver-cache && (saw-remote-api http --host 0.0.0.0 --port 8080 / &) && .ci/run-saw-python-files.sh'
